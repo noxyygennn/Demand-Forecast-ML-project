@@ -44,12 +44,13 @@ def _simple_holidays(year: int) -> set[date]:
     Нужен, чтобы в данных был эффект "праздников".
     """
     return {
-        date(year, 1, 1),   # New Year
-        date(year, 1, 7),   # example holiday
+        date(year, 1, 1),   
+        date(year, 1, 7),   
         date(year, 3, 8),
         date(year, 5, 1),
         date(year, 5, 9),
-        date(year, 12, 25),
+        date(year, 5, 2),
+        date(year, 2, 23),
     }
 
 
@@ -68,12 +69,12 @@ def generate(
 
     dates = [start + timedelta(days=i) for i in range(days)]
 
-    # зададим параметры на SKU (слегка разные)
+    # зададим параметры на SKU (псевдослучайные)
     params: list[SkuParams] = []
     for i in range(skus):
         p = SkuParams(
             base_demand=float(rng.integers(20, 120)),
-            trend_per_day=float(rng.normal(0.02, 0.02)),     # небольшой тренд
+            trend_per_day=float(rng.normal(0.02, 0.02)),     
             weekly_amp=float(rng.uniform(0.05, 0.25)),
             yearly_amp=float(rng.uniform(0.05, 0.35)),
             noise_std=float(rng.uniform(2.0, 12.0)),
@@ -89,7 +90,7 @@ def generate(
         sku = f"SKU_{sku_idx+1:02d}"
         p = params[sku_idx]
 
-        # индивидуальная "любимая" фаза сезонности
+        
         weekly_phase = rng.uniform(0, 2 * math.pi)
         yearly_phase = rng.uniform(0, 2 * math.pi)
 
@@ -102,11 +103,11 @@ def generate(
             holidays = _simple_holidays(d.year)
             is_holiday = int(d in holidays)
 
-            # цена слегка гуляет (как random walk)
+           
             price_shock = rng.normal(0.0, p.price_vol)
             price = max(0.5, price * (1.0 + price_shock))
 
-            # промо события: редкие блоки по 3-10 дней
+            # промо события
             # вероятность старта промо
             promo_start_prob = 0.012
             if rng.random() < promo_start_prob:
