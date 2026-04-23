@@ -48,7 +48,7 @@ python -m src.evaluate_baselines --data data/sales.csv --lookback 30 --test-days
 ## Milestone 3 — Нейросеть (PyTorch LSTM)
 
 ```bash
-python -m src.train_torch --data data/sales.csv --lookback 28 --horizon 14 --test-days 120 --val-days 60 --epochs 15 --batch 512 --device cpu
+python -m src.train_torch --data data/sales.csv --lookback 28 --horizon 14 --test-days 120 --val-days 60 --epochs 40 --device cpu
 ```
 
 Результаты:
@@ -71,7 +71,7 @@ python -m src.report --data data/sales.csv --sku SKU_01
 ## Milestone 4 — MVP сервис (Streamlit)
 
 ```bash
-streamlit run streamlit_app.py
+python -m streamlit run streamlit_app.py
 ```
 
 ### Деплой на Streamlit Community Cloud
