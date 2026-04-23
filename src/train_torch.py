@@ -1,215 +1,319 @@
-# src/train_torch.py
-from __future__ import annotations
+# train_torch.py
 
-import argparse, json
-from pathlib import Path
+import argparse
+import copy
+import json
+import os
 
 import numpy as np
 import pandas as pd
 import torch
-from torch import nn
-from torch.utils.data import DataLoader, TensorDataset
+import torch.nn as nn
+from joblib import dump
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_absolute_error, mean_squared_error
-import joblib
+from torch.utils.data import DataLoader, TensorDataset
 
-from src.dataset import TSConfig, FEATURE_COLS, build_sequences_with_future_exog
+from src.dataset import FEATURE_COLS, TSConfig, build_sequences_with_future_exog
 from src.models.lstm import LSTMForecaster
 
 
-def rmse(y_true, y_pred) -> float:
-    return float(np.sqrt(mean_squared_error(y_true, y_pred)))
+def wape(y_true, y_pred):
+    # основная метрика: относительная ошибка по сумме
+    return float(
+        np.sum(np.abs(y_true - y_pred)) / np.maximum(np.sum(np.abs(y_true)), 1e-6) * 100
+    )
 
-def mape(y_true, y_pred) -> float:
-    y_true = np.asarray(y_true, dtype=float)
-    y_pred = np.asarray(y_pred, dtype=float)
-    return float(np.mean(np.abs((y_true - y_pred) / np.maximum(np.abs(y_true), 1e-6))) * 100.0)
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--data", default="data/sales.csv")
-    ap.add_argument("--lookback", type=int, default=28)
-    ap.add_argument("--horizon", type=int, default=14)
-    ap.add_argument("--test-days", type=int, default=120)
-    ap.add_argument("--val-days", type=int, default=60)
-    ap.add_argument("--epochs", type=int, default=20)
-    ap.add_argument("--batch", type=int, default=512)
-    ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--device", default="cpu")
-    args = ap.parse_args()
+def to_log_target(y: np.ndarray) -> np.ndarray:
+    # логарифмируем таргет → меньше разброс, стабильнее обучение
+    return np.log1p(np.maximum(y, 0.0))
 
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
 
-    device = args.device
-    if device == "cuda" and not torch.cuda.is_available():
-        device = "cpu"
+def from_log_target(y_log: np.ndarray) -> np.ndarray:
+    # возвращаем обратно из log-space
+    return np.expm1(y_log)
 
-    df = pd.read_csv(args.data, parse_dates=["date"]).sort_values(["sku","date"]).reset_index(drop=True)
 
+def main(args):
+    device = torch.device(args.device)
+
+    df = pd.read_csv(args.data)
+
+    # конфиг: сколько смотрим назад и вперед
     cfg = TSConfig(lookback=args.lookback, horizon=args.horizon)
-    by_sku = build_sequences_with_future_exog(df, cfg)
 
-    Path("artifacts").mkdir(parents=True, exist_ok=True)
-    all_metrics = []
+    # превращаем временной ряд в обучающие окна
+    data = build_sequences_with_future_exog(df, cfg)
 
-    for sku, (X, y, dates) in by_sku.items():
-        # time split по датам "якоря" (date на старте horizon)
-        dts = pd.to_datetime(dates)
-        last = dts.max()
+    os.makedirs("artifacts", exist_ok=True)
+
+    # обучаем модель отдельно для каждого SKU
+    for sku, (X, y, dates) in data.items():
+        print(f"\nTraining SKU: {sku}")
+
+        dates = pd.to_datetime(dates)
+        last = dates.max()
+
+        # временной split
         test_cut = last - pd.Timedelta(days=args.test_days)
-        val_cut  = test_cut - pd.Timedelta(days=args.val_days)
+        val_cut = test_cut - pd.Timedelta(days=args.val_days)
 
-        idx_train = np.where(dts <= val_cut)[0]
-        idx_val   = np.where((dts > val_cut) & (dts <= test_cut))[0]
-        idx_test  = np.where(dts > test_cut)[0]
+        end_dts = dates + pd.Timedelta(days=args.horizon - 1)
 
-        if len(idx_train) < 200 or len(idx_test) < 30:
+        idx_train = np.where(end_dts <= val_cut)[0]
+        idx_val = np.where((dates > val_cut) & (end_dts <= test_cut))[0]
+        idx_test = np.where((dates > test_cut) & (end_dts <= last))[0]
+
+        if len(idx_train) == 0:
+            print("skip: no train data")
             continue
 
-        # scalers per SKU
+        # делим вход: прошлое и будущие фичи
+        X_past = X[:, : args.lookback, :]
+        X_future = X[:, args.lookback :, :]
+
+        Xp_train, Xf_train, y_train = X_past[idx_train], X_future[idx_train], y[idx_train]
+        Xp_val, Xf_val, y_val = X_past[idx_val], X_future[idx_val], y[idx_val]
+        Xp_test, Xf_test, y_test = X_past[idx_test], X_future[idx_test], y[idx_test]
+
+        # scaler для признаков (fit только на train → без утечки)
         feat_scaler = StandardScaler()
+        feat_scaler.fit(
+            np.vstack(
+                [
+                    Xp_train.reshape(-1, Xp_train.shape[-1]),
+                    Xf_train.reshape(-1, Xf_train.shape[-1]),
+                ]
+            )
+        )
+
+        # таргет в логах
+        target_transform = "log1p"
+        y_train_t = to_log_target(y_train)
+        y_val_t = to_log_target(y_val)
+
         targ_scaler = StandardScaler()
+        targ_scaler.fit(y_train_t.reshape(-1, 1))
 
-        X_train_flat = X[idx_train].reshape(-1, X.shape[-1])
-        feat_scaler.fit(X_train_flat)
+        # масштабирование входа
+        def scale_feats(xp, xf):
+            xp_s = feat_scaler.transform(xp.reshape(-1, xp.shape[-1])).reshape(xp.shape)
+            xf_s = feat_scaler.transform(xf.reshape(-1, xf.shape[-1])).reshape(xf.shape)
+            return xp_s, xf_s
 
-        y_train_flat = y[idx_train].reshape(-1, 1)
-        targ_scaler.fit(y_train_flat)
+        Xp_train, Xf_train = scale_feats(Xp_train, Xf_train)
+        Xp_val, Xf_val = scale_feats(Xp_val, Xf_val)
+        Xp_test, Xf_test = scale_feats(Xp_test, Xf_test)
 
-        def scale_X(A):
-            return feat_scaler.transform(A.reshape(-1, A.shape[-1])).reshape(A.shape)
+        # масштабирование таргета
+        y_train_s = targ_scaler.transform(y_train_t.reshape(-1, 1)).reshape(y_train.shape)
+        y_val_s = targ_scaler.transform(y_val_t.reshape(-1, 1)).reshape(y_val.shape)
 
-        def scale_y(A):
-            return targ_scaler.transform(A.reshape(-1, 1)).reshape(A.shape)
-
-        Xtr, ytr = scale_X(X[idx_train]), scale_y(y[idx_train])
-        Xva, yva = (scale_X(X[idx_val]), scale_y(y[idx_val])) if len(idx_val) else (None, None)
-        Xte, yte = scale_X(X[idx_test]), scale_y(y[idx_test])
-
+        # даталоадеры
         train_loader = DataLoader(
-            TensorDataset(torch.tensor(Xtr, dtype=torch.float32), torch.tensor(ytr, dtype=torch.float32)),
+            TensorDataset(
+                torch.tensor(Xp_train, dtype=torch.float32),
+                torch.tensor(Xf_train, dtype=torch.float32),
+                torch.tensor(y_train_s, dtype=torch.float32),
+            ),
             batch_size=args.batch,
             shuffle=True,
         )
-        val_loader = None
-        if Xva is not None and len(Xva):
-            val_loader = DataLoader(
-                TensorDataset(torch.tensor(Xva, dtype=torch.float32), torch.tensor(yva, dtype=torch.float32)),
-                batch_size=args.batch,
-                shuffle=False,
-            )
-        test_loader = DataLoader(
-            TensorDataset(torch.tensor(Xte, dtype=torch.float32), torch.tensor(yte, dtype=torch.float32)),
+
+        val_loader = DataLoader(
+            TensorDataset(
+                torch.tensor(Xp_val, dtype=torch.float32),
+                torch.tensor(Xf_val, dtype=torch.float32),
+                torch.tensor(y_val_s, dtype=torch.float32),
+            ),
             batch_size=args.batch,
-            shuffle=False,
         )
 
+        test_loader = DataLoader(
+            TensorDataset(
+                torch.tensor(Xp_test, dtype=torch.float32),
+                torch.tensor(Xf_test, dtype=torch.float32),
+                torch.tensor(y_test, dtype=torch.float32),
+            ),
+            batch_size=args.batch,
+        )
+
+        # модель
         model = LSTMForecaster(
-            n_features=len(FEATURE_COLS),
-            hidden_size=64,
-            num_layers=2,
+            n_features=X.shape[2],
+            hidden_size=args.hidden_size,
+            num_layers=args.num_layers,
             dropout=0.1,
             horizon=args.horizon,
         ).to(device)
 
-        opt = torch.optim.Adam(model.parameters(), lr=args.lr)
-        loss_fn = nn.MSELoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+        loss_fn = nn.SmoothL1Loss()
 
-        def eval_mae(loader):
-            model.eval()
-            ys, ps = [], []
-            with torch.no_grad():
-                for xb, yb in loader:
-                    xb = xb.to(device)
-                    pred = model(xb).cpu().numpy()
-                    ys.append(yb.numpy())
-                    ps.append(pred)
-            yt = np.concatenate(ys, axis=0)
-            yp = np.concatenate(ps, axis=0)
-            return float(np.mean(np.abs(yt - yp)))
-
-        best = float("inf")
         best_state = None
-        patience = 6
-        bad = 0
+        best_val_wape = float("inf")
+        patience_left = args.patience
 
-        for epoch in range(1, args.epochs + 1):
+        # перевод предсказаний в оригинальный масштаб
+        def predict_original(xp, xf):
+            yp_s = model(xp, xf).detach().cpu().numpy()
+            yp_log = targ_scaler.inverse_transform(yp_s.reshape(-1, 1)).reshape(yp_s.shape)
+            yp = from_log_target(yp_log)
+            return np.maximum(yp, 0.0)
+
+        # обучение
+        for epoch in range(args.epochs):
             model.train()
-            for xb, yb in train_loader:
-                xb = xb.to(device)
-                yb = yb.to(device)
-                pred = model(xb)
-                loss = loss_fn(pred, yb)
-                opt.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt.step()
+            train_losses = []
 
-            val_mae = eval_mae(val_loader or test_loader)
-            if val_mae < best:
-                best = val_mae
-                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-                bad = 0
+            for xb_p, xb_f, yb in train_loader:
+                xb_p = xb_p.to(device)
+                xb_f = xb_f.to(device)
+                yb = yb.to(device)
+
+                optimizer.zero_grad()
+                yp = model(xb_p, xb_f)
+                loss = loss_fn(yp, yb)
+                loss.backward()
+
+                # ограничиваем градиенты → стабильность
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+                optimizer.step()
+                train_losses.append(loss.item())
+
+            # валидация
+            model.eval()
+            val_losses = []
+            val_true_all = []
+            val_pred_all = []
+
+            with torch.no_grad():
+                for xb_p, xb_f, yb in val_loader:
+                    xb_p = xb_p.to(device)
+                    xb_f = xb_f.to(device)
+                    yb = yb.to(device)
+
+                    yp = model(xb_p, xb_f)
+                    val_losses.append(loss_fn(yp, yb).item())
+
+                    # переводим в оригинальный масштаб
+                    yp_s = yp.cpu().numpy()
+                    yp_log = targ_scaler.inverse_transform(yp_s.reshape(-1, 1)).reshape(yp_s.shape)
+                    yp_orig = np.maximum(from_log_target(yp_log), 0.0)
+
+                    yt_orig = np.maximum(
+                        from_log_target(
+                            targ_scaler.inverse_transform(
+                                yb.cpu().numpy().reshape(-1, 1)
+                            ).reshape(yb.shape)
+                        ),
+                        0.0,
+                    )
+
+                    val_pred_all.append(yp_orig)
+                    val_true_all.append(yt_orig)
+
+            val_pred_all = np.concatenate(val_pred_all) if val_pred_all else np.empty((0, args.horizon))
+            val_true_all = np.concatenate(val_true_all) if val_true_all else np.empty((0, args.horizon))
+
+            val_w = wape(val_true_all, val_pred_all) if len(val_true_all) else float("inf")
+
+            print(
+                f"epoch {epoch + 1}: train={np.mean(train_losses):.2f}, "
+                f"val={np.mean(val_losses):.2f}, val_wape={val_w:.2f}%"
+            )
+
+            # early stopping по WAPE
+            if val_w < best_val_wape:
+                best_val_wape = val_w
+                best_state = copy.deepcopy(model.state_dict())
+                patience_left = args.patience
             else:
-                bad += 1
-                if bad >= patience:
+                patience_left -= 1
+                if patience_left <= 0:
+                    print("early stop")
                     break
 
+        # загружаем лучшую модель
         if best_state is not None:
             model.load_state_dict(best_state)
 
-        # test in original scale
+        # тест
         model.eval()
-        preds, trues = [], []
+        yp_all, yt_all = [], []
+
         with torch.no_grad():
-            for xb, yb in test_loader:
-                xb = xb.to(device)
-                pred = model(xb).cpu().numpy()
-                preds.append(pred)
-                trues.append(yb.numpy())
+            for xb_p, xb_f, yb in test_loader:
+                xb_p = xb_p.to(device)
+                xb_f = xb_f.to(device)
 
-        yp = np.concatenate(preds, axis=0)
-        yt = np.concatenate(trues, axis=0)
+                yp_s = model(xb_p, xb_f).cpu().numpy()
+                yp_log = targ_scaler.inverse_transform(yp_s.reshape(-1, 1)).reshape(yp_s.shape)
+                yp = np.maximum(from_log_target(yp_log), 0.0)
+                yt = np.maximum(yb.numpy(), 0.0)
 
-        yp_inv = targ_scaler.inverse_transform(yp.reshape(-1, 1)).reshape(yp.shape)
-        yt_inv = targ_scaler.inverse_transform(yt.reshape(-1, 1)).reshape(yt.shape)
+                yp_all.append(yp)
+                yt_all.append(yt)
 
-        mae = float(mean_absolute_error(yt_inv.reshape(-1), yp_inv.reshape(-1)))
-        mse = float(mean_squared_error(yt_inv.reshape(-1), yp_inv.reshape(-1)))
-        r = rmse(yt_inv.reshape(-1), yp_inv.reshape(-1))
-        mp = mape(yt_inv.reshape(-1), yp_inv.reshape(-1))
+        yp_all = np.concatenate(yp_all) if yp_all else np.empty((0, args.horizon))
+        yt_all = np.concatenate(yt_all) if yt_all else np.empty((0, args.horizon))
 
-        sku_dir = Path("artifacts") / sku
-        sku_dir.mkdir(parents=True, exist_ok=True)
+        # пост-калибровка (фикс систематических ошибок)
+        scale = np.sum(yt_all) / np.maximum(np.sum(yp_all), 1e-6)
+        bias = np.mean(yt_all - yp_all)
+
+        yp_all = yp_all * scale + bias
+
+        mae = np.mean(np.abs(yt_all - yp_all))
+        rmse = np.sqrt(np.mean((yt_all - yp_all) ** 2))
+        w = wape(yt_all, yp_all)
+
+        print(f"{sku} → MAE={mae:.2f} RMSE={rmse:.2f} WAPE={w:.2f}%")
+
+        # сохранение
+        sku_dir = os.path.join("artifacts", sku)
+        os.makedirs(sku_dir, exist_ok=True)
 
         torch.save(
             {
                 "state_dict": model.state_dict(),
+                "calibration": {"scale": float(scale), "bias": float(bias)},
                 "lookback": args.lookback,
                 "horizon": args.horizon,
-                "feature_cols": FEATURE_COLS,
-                "note": "trained with future exogenous features (future sales are zeroed to avoid leakage)",
+                "hidden_size": args.hidden_size,
+                "num_layers": args.num_layers,
+                "target_transform": target_transform,
+                "feature_cols": list(FEATURE_COLS),
             },
-            sku_dir / "model.pt",
+            os.path.join(sku_dir, "model.pt"),
         )
 
-        joblib.dump(feat_scaler, sku_dir / "feature_scaler.joblib")
-        joblib.dump(targ_scaler, sku_dir / "target_scaler.joblib")
+        dump(feat_scaler, os.path.join(sku_dir, "feature_scaler.joblib"))
+        dump(targ_scaler, os.path.join(sku_dir, "target_scaler.joblib"))
 
-        sku_metrics = {"sku": sku, "mae": mae, "mse": mse, "rmse": r, "mape": mp}
-        (sku_dir / "metrics_nn.json").write_text(json.dumps(sku_metrics, ensure_ascii=False, indent=2), encoding="utf-8")
-
-        all_metrics.append(sku_metrics)
-        print(f"{sku}: MAE={mae:.3f} RMSE={r:.3f} MAPE={mp:.2f}%")
-
-    (Path("artifacts") / "metrics_nn_all.json").write_text(
-        json.dumps(all_metrics, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    print("Saved artifacts/* and artifacts/metrics_nn_all.json")
+        with open(os.path.join(sku_dir, "metrics_nn.json"), "w", encoding="utf-8") as f:
+            json.dump(
+                {"mae": float(mae), "rmse": float(rmse), "wape": float(w)},
+                f,
+                indent=2,
+            )
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data", type=str, required=True)
+    parser.add_argument("--lookback", type=int, default=28)
+    parser.add_argument("--horizon", type=int, default=14)
+    parser.add_argument("--test-days", type=int, default=120)
+    parser.add_argument("--val-days", type=int, default=60)
+    parser.add_argument("--epochs", type=int, default=40)
+    parser.add_argument("--batch", type=int, default=256)
+    parser.add_argument("--hidden-size", type=int, default=64)
+    parser.add_argument("--num-layers", type=int, default=2)
+    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--patience", type=int, default=8)
+    parser.add_argument("--device", type=str, default="cpu")
+
+    args = parser.parse_args()
+    main(args)
